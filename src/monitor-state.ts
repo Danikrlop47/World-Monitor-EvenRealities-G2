@@ -1,6 +1,6 @@
 import { MODULES, moduleById, type MonitorModule } from './modules/definitions'
 import { itemsForModule, type ModuleItem } from './modules/demo-data'
-import { formatDetailOverlay } from './modules/format-glasses'
+import { feedListIndexToItemIndex, formatDetailOverlay, isFeedBackRow } from './modules/format-glasses'
 
 export type OverlayMode = 'none' | 'module' | 'detail'
 
@@ -10,6 +10,8 @@ export interface MonitorSnapshot {
   moduleNum: number
   /** Highlighted row in the home module picker (glasses HUD). */
   pickerIndex: number
+  /** Highlighted row in the module feed list (0 = Back). */
+  feedListIndex: number
   item: ModuleItem
   index: number
   total: number
@@ -24,6 +26,7 @@ const DETAIL_SCROLL_STEP = 120
 export class MonitorState {
   private module: MonitorModule = 'wire'
   private pickerIndex = 0
+  private feedListIndex = 0
   private index = 0
   private overlay: OverlayMode = 'none'
   private detailScrollOffset = 0
@@ -37,6 +40,7 @@ export class MonitorState {
       moduleLabel: def.label,
       moduleNum: def.num,
       pickerIndex: this.pickerIndex,
+      feedListIndex: this.feedListIndex,
       item: items[this.index],
       index: this.index,
       total: items.length,
@@ -59,12 +63,25 @@ export class MonitorState {
     return MODULES
   }
 
-  /** Sync glasses list selection (native menu scroll). */
+  /** Sync glasses home list selection (native menu scroll). */
   setPickerIndex(index: number): void {
     if (this.overlay !== 'none') return
     if (index < 0 || index >= MODULES.length) return
     if (index === this.pickerIndex) return
     this.pickerIndex = index
+    this.notify()
+  }
+
+  /** Sync glasses module feed list selection (0 = Back, 1+ = feed item). */
+  setFeedIndex(listIndex: number): void {
+    if (this.overlay !== 'module') return
+    const items = itemsForModule(this.module)
+    if (listIndex < 0 || listIndex > items.length) return
+    if (listIndex === this.feedListIndex) return
+    this.feedListIndex = listIndex
+    if (!isFeedBackRow(listIndex)) {
+      this.index = feedListIndexToItemIndex(listIndex)
+    }
     this.notify()
   }
 
@@ -74,6 +91,7 @@ export class MonitorState {
     const picked = MODULES[this.pickerIndex]
     this.module = picked.id
     this.index = 0
+    this.feedListIndex = 0
     this.overlay = 'module'
     this.detailScrollOffset = 0
     this.notify()
@@ -85,6 +103,7 @@ export class MonitorState {
     if (pick >= 0) this.pickerIndex = pick
     this.module = module
     this.index = 0
+    this.feedListIndex = 0
     this.overlay = 'module'
     this.detailScrollOffset = 0
     this.notify()
@@ -94,6 +113,7 @@ export class MonitorState {
     const items = itemsForModule(this.module)
     if (index < 0 || index >= items.length) return
     this.index = index
+    this.feedListIndex = index + 1
     this.overlay = 'detail'
     this.detailScrollOffset = 0
     this.notify()
@@ -120,18 +140,51 @@ export class MonitorState {
     this.notify()
   }
 
-  /** Glasses tap — open selected module, then detail, then step back. */
+  /** Glasses tap on a feed list row (0 = Back, 1+ = open article). */
+  glassesTapFeedRow(listIndex: number): void {
+    if (this.overlay !== 'module') return
+
+    this.feedListIndex = listIndex
+    if (isFeedBackRow(listIndex)) {
+      this.glassesGoBack()
+      return
+    }
+
+    const items = itemsForModule(this.module)
+    if (listIndex < 1 || listIndex > items.length) return
+    this.index = feedListIndexToItemIndex(listIndex)
+    this.overlay = 'detail'
+    this.detailScrollOffset = 0
+    this.notify()
+  }
+
+  /** Glasses tap — open module or article (forward only). */
   glassesTap(): void {
     if (this.overlay === 'none') {
       this.openSelectedModule()
     } else if (this.overlay === 'module') {
-      this.overlay = 'detail'
-      this.detailScrollOffset = 0
-    } else {
-      this.overlay = 'module'
-      this.detailScrollOffset = 0
+      this.glassesTapFeedRow(this.feedListIndex)
     }
-    this.notify()
+  }
+
+  /** Glasses hold — step back one screen (detail → module → home). */
+  glassesGoBack(): void {
+    if (this.overlay === 'detail') {
+      this.overlay = 'module'
+      this.feedListIndex = this.index + 1
+      this.detailScrollOffset = 0
+      this.notify()
+      return
+    }
+
+    if (this.overlay === 'module') {
+      const pick = MODULES.findIndex(m => m.id === this.module)
+      if (pick >= 0) this.pickerIndex = pick
+      this.overlay = 'none'
+      this.feedListIndex = 0
+      this.detailScrollOffset = 0
+      this.notify()
+    }
   }
 
   scrollOlder(): void {
@@ -141,11 +194,7 @@ export class MonitorState {
     }
 
     if (this.overlay === 'module') {
-      const items = itemsForModule(this.module)
-      if (this.index < items.length - 1) {
-        this.index++
-        this.notify()
-      }
+      // Native feed list handles scrolling on glasses.
       return
     }
 
@@ -159,16 +208,6 @@ export class MonitorState {
     }
 
     if (this.overlay === 'module') {
-      if (this.index > 0) {
-        this.index--
-        this.notify()
-        return
-      }
-      const pick = MODULES.findIndex(m => m.id === this.module)
-      if (pick >= 0) this.pickerIndex = pick
-      this.overlay = 'none'
-      this.detailScrollOffset = 0
-      this.notify()
       return
     }
 
@@ -187,6 +226,7 @@ export class MonitorState {
   private scrollDetailUp(): void {
     if (this.detailScrollOffset <= 0) {
       this.overlay = 'module'
+      this.feedListIndex = this.index + 1
       this.detailScrollOffset = 0
       this.notify()
       return

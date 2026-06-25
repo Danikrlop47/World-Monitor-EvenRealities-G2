@@ -28,8 +28,10 @@ import {
 } from './layout/display'
 import { MODULES } from './modules/definitions'
 import type { MonitorSnapshot } from './monitor-state'
-import { formatPopOverlay, moduleListItemNames } from './modules/format-glasses'
+import { formatDetailOverlay, isFeedBackListEvent, moduleFeedItemNames, moduleListItemNames } from './modules/format-glasses'
 import { mapItemsKey, renderMapTiles, tilesEqual } from './map/render-map'
+import { getGlobeRotationY, subscribeGlobeRotation } from './map/globe-rotation'
+import { GlassesHoldGesture } from './glasses-hold'
 import type { ModuleItem } from './modules/demo-data'
 
 const LIST_CONTAINER_ID = 6
@@ -41,14 +43,53 @@ export interface MonitorScrollHandlers {
   scrollOlder: () => void
   scrollNewer: () => void
   glassesTap: () => void
+  glassesTapFeedRow: (listIndex: number) => void
+  glassesGoBack: () => void
   setPickerIndex: (index: number) => void
+  setFeedIndex: (index: number) => void
   openSelectedModule: () => void
   isHomeMenu: () => boolean
+  isModuleFeed: () => boolean
+  getFeedItems: () => ModuleItem[]
+  getFeedIndex: () => number
 }
 
 function normalizeEventType(raw: unknown): OsEventTypeList | undefined {
   if (raw === undefined || raw === null) return undefined
+  if (raw === 9 || raw === '9' || raw === 'LONG_PRESS_EVENT' || raw === 'LONG_PRESS') {
+    return undefined
+  }
   return OsEventTypeList.fromJson(raw)
+}
+
+function isLongPressEvent(event: EvenHubEvent): boolean {
+  const rawTypes = [
+    event.listEvent?.eventType,
+    event.textEvent?.eventType,
+    event.sysEvent?.eventType,
+    (event.jsonData as { eventType?: unknown } | undefined)?.eventType,
+  ]
+  return rawTypes.some(
+    raw => raw === 9 || raw === '9' || raw === 'LONG_PRESS_EVENT' || raw === 'LONG_PRESS',
+  )
+}
+
+function resolveFeedIndex(listEvent: List_ItemEvent, items: ModuleItem[]): number | undefined {
+  const names = moduleFeedItemNames(items)
+  const name = listEvent.currentSelectItemName
+  if (name) {
+    const byName = names.findIndex(n => n === name)
+    if (byName >= 0) return byName
+  }
+
+  if (
+    listEvent.currentSelectItemIndex !== undefined &&
+    listEvent.currentSelectItemIndex !== null
+  ) {
+    return listEvent.currentSelectItemIndex
+  }
+
+  return undefined
 }
 
 function resolveListIndex(listEvent: List_ItemEvent): number | undefined {
@@ -69,6 +110,10 @@ function resolveListIndex(listEvent: List_ItemEvent): number | undefined {
 }
 
 function resolveEventType(event: EvenHubEvent): OsEventTypeList | undefined {
+  return resolveScrollType(event)
+}
+
+function resolveScrollType(event: EvenHubEvent): OsEventTypeList | undefined {
   const fromList = normalizeEventType(event.listEvent?.eventType)
   if (fromList !== undefined) return fromList
 
@@ -79,32 +124,55 @@ function resolveEventType(event: EvenHubEvent): OsEventTypeList | undefined {
   if (fromSys !== undefined) return fromSys
 
   const json = event.jsonData as { eventType?: unknown; eventSource?: unknown } | undefined
-  const fromJson = normalizeEventType(json?.eventType)
-  if (fromJson !== undefined) return fromJson
+  return normalizeEventType(json?.eventType)
+}
 
+/** Touch-down before click release (simulator Click hold, glasses touchpad). */
+function isPressStart(event: EvenHubEvent): boolean {
   if (
     event.sysEvent?.eventSource != null &&
     event.sysEvent.eventType == null &&
     !event.sysEvent.imuData
   ) {
-    return OsEventTypeList.CLICK_EVENT
+    return true
   }
 
+  const json = event.jsonData as { eventType?: unknown; eventSource?: unknown } | undefined
   if (
     json?.eventSource != null &&
     json.eventType == null &&
     !event.textEvent &&
     !event.listEvent
   ) {
-    return OsEventTypeList.CLICK_EVENT
+    return true
   }
 
-  return undefined
+  return false
+}
+
+function isClickEvent(type: OsEventTypeList | undefined): boolean {
+  return type === OsEventTypeList.CLICK_EVENT || type === undefined
+}
+
+function inferFeedListIndex(
+  prevIndex: number,
+  type: OsEventTypeList,
+  rowCount: number,
+): number {
+  if (rowCount <= 0) return 0
+  if (type === OsEventTypeList.SCROLL_BOTTOM_EVENT) {
+    return Math.min(rowCount - 1, prevIndex + 1)
+  }
+  if (type === OsEventTypeList.SCROLL_TOP_EVENT) {
+    return Math.max(0, prevIndex - 1)
+  }
+  return prevIndex
 }
 
 export class GlassesHud {
   private pageReady = false
-  private overlayLayoutOpen = false
+  private overlayMode: MonitorSnapshot['overlay'] = 'none'
+  private lastFeedKey = ''
   private mapFlushPromise: Promise<void> | null = null
   private pendingMapKey: string | null = null
   private pendingMapItems: ModuleItem[] = []
@@ -114,6 +182,16 @@ export class GlassesHud {
   private lastMapKey = ''
   private lastPanelKey = ''
   private lastMapTiles: (Uint8Array | null)[] = [null, null, null, null]
+  private mapItems: ModuleItem[] = []
+  private mapIndex = 0
+  private mapOverlay: MonitorSnapshot['overlay'] = 'none'
+  private pendingRotY: number | null = null
+  private lastGlobeUploadAt = 0
+  private globeUnsub: (() => void) | null = null
+  /** Native feed list selection — kept in sync from list events (monitor index can lag). */
+  private nativeFeedIndex = 0
+
+  private static readonly GLOBE_UPLOAD_MS = 350
 
   constructor(
     private bridge: EvenAppBridge,
@@ -143,7 +221,31 @@ export class GlassesHud {
     })
   }
 
-  /** Full-screen pop-forward module window. */
+  /** Native module feed list — same separated rows as the home menu. */
+  private moduleFeedList(items: ModuleItem[]) {
+    const names = moduleFeedItemNames(items)
+    return new ListContainerProperty({
+      xPosition: POP_WINDOW_X,
+      yPosition: POP_WINDOW_Y,
+      width: POP_WINDOW_W,
+      height: POP_WINDOW_H,
+      borderWidth: 1,
+      borderColor: 5,
+      borderRadius: POP_WINDOW_RADIUS,
+      paddingLength: 4,
+      containerID: LIST_CONTAINER_ID,
+      containerName: 'feed-menu',
+      itemContainer: new ListItemContainerProperty({
+        itemCount: names.length,
+        itemWidth: 0,
+        isItemSelectBorderEn: 1,
+        itemName: names,
+      }),
+      isEventCapture: 1,
+    })
+  }
+
+  /** Full-screen detail text. */
   private popPanel() {
     return new TextContainerProperty({
       xPosition: POP_WINDOW_X,
@@ -191,7 +293,7 @@ export class GlassesHud {
     )
 
     this.pageReady = result === 0
-    this.overlayLayoutOpen = false
+    this.overlayMode = 'none'
     console.log('[hud] page created:', this.pageReady ? 'ok' : `failed (${result})`)
   }
 
@@ -205,23 +307,18 @@ export class GlassesHud {
     )
 
     this.pageReady = ok
-    this.overlayLayoutOpen = false
+    this.overlayMode = 'none'
     this.lastPanelKey = ''
     this.lastMapKey = ''
     this.lastMapTiles = [null, null, null, null]
     console.log('[hud] page rebuilt:', ok ? 'ok' : 'failed')
   }
 
-  private async rebuildForOverlay(open: boolean): Promise<void> {
-    if (open) {
-      const ok = await this.bridge.rebuildPageContainer(
-        new RebuildPageContainer({
-          containerTotalNum: 1,
-          textObject: [this.popPanel()],
-        }),
-      )
-      if (!ok) console.warn('[hud] overlay rebuild failed')
-    } else {
+  private async rebuildForOverlayMode(
+    mode: MonitorSnapshot['overlay'],
+    items: ModuleItem[],
+  ): Promise<void> {
+    if (mode === 'none') {
       const ok = await this.bridge.rebuildPageContainer(
         new RebuildPageContainer({
           containerTotalNum: 5,
@@ -233,9 +330,26 @@ export class GlassesHud {
       this.lastMapKey = ''
       this.lastMapTiles = [null, null, null, null]
       this.forceNextMapFlush = true
+    } else if (mode === 'module') {
+      this.nativeFeedIndex = 0
+      const ok = await this.bridge.rebuildPageContainer(
+        new RebuildPageContainer({
+          containerTotalNum: 1,
+          listObject: [this.moduleFeedList(items)],
+        }),
+      )
+      if (!ok) console.warn('[hud] feed list rebuild failed')
+    } else {
+      const ok = await this.bridge.rebuildPageContainer(
+        new RebuildPageContainer({
+          containerTotalNum: 1,
+          textObject: [this.popPanel()],
+        }),
+      )
+      if (!ok) console.warn('[hud] detail rebuild failed')
     }
 
-    this.overlayLayoutOpen = open
+    this.overlayMode = mode
     this.lastPanelKey = ''
   }
 
@@ -245,6 +359,13 @@ export class GlassesHud {
   }
 
   sync(snapshot: MonitorSnapshot, items: ModuleItem[]): Promise<void> {
+    this.mapItems = items
+    this.mapIndex = snapshot.index
+    this.mapOverlay = snapshot.overlay
+    if (snapshot.overlay === 'module') {
+      this.nativeFeedIndex = snapshot.feedListIndex
+    }
+
     this.uiQueue = this.uiQueue.then(async () => {
       if (!this.pageReady) return
       await this.renderPanel(snapshot)
@@ -253,6 +374,26 @@ export class GlassesHud {
       }
     })
     return this.uiQueue
+  }
+
+  /** Throttled globe rotation frames for glasses map tiles (home menu only). */
+  bindGlobeRotation(): () => void {
+    if (this.globeUnsub) return this.globeUnsub
+
+    this.globeUnsub = subscribeGlobeRotation(rotY => {
+      if (!this.pageReady || this.mapOverlay !== 'none') return
+
+      const now = performance.now()
+      if (now - this.lastGlobeUploadAt < GlassesHud.GLOBE_UPLOAD_MS) return
+
+      this.pendingRotY = rotY
+      void this.scheduleMapFlush()
+    })
+
+    return () => {
+      this.globeUnsub?.()
+      this.globeUnsub = null
+    }
   }
 
   renderMap(snapshot: MonitorSnapshot, items: ModuleItem[]): Promise<void> {
@@ -275,29 +416,45 @@ export class GlassesHud {
     if (!this.mapFlushPromise) {
       this.mapFlushPromise = this.flushPendingMap().finally(() => {
         this.mapFlushPromise = null
-        if (this.pendingMapKey) void this.scheduleMapFlush()
+        if (this.pendingMapKey || this.pendingRotY !== null) void this.scheduleMapFlush()
       })
     }
     return this.mapFlushPromise
   }
 
   private async flushPendingMap(): Promise<void> {
-    while (this.pendingMapKey) {
-      const mapKey = this.pendingMapKey
-      const items = this.pendingMapItems
-      const index = this.pendingMapIndex
-      this.pendingMapKey = null
-      const forceAllTiles = this.forceNextMapFlush
-      this.forceNextMapFlush = false
+    while (this.pendingMapKey || (this.pendingRotY !== null && this.mapOverlay === 'none')) {
+      if (this.pendingMapKey) {
+        const mapKey = this.pendingMapKey
+        const items = this.pendingMapItems
+        const index = this.pendingMapIndex
+        this.pendingMapKey = null
+        const forceAllTiles = this.forceNextMapFlush
+        this.forceNextMapFlush = false
 
-      if (!forceAllTiles && mapKey === this.lastMapKey) continue
+        if (!forceAllTiles && mapKey === this.lastMapKey) continue
+
+        try {
+          const tiles = await renderMapTiles(items, index, getGlobeRotationY())
+          await this.uploadMapTilesSequential(tiles, forceAllTiles)
+          this.lastMapKey = mapKey
+        } catch (err) {
+          console.warn('[hud] map render failed:', err)
+        }
+        continue
+      }
+
+      if (this.pendingRotY === null || this.mapOverlay !== 'none') continue
+
+      const rotY = this.pendingRotY
+      this.pendingRotY = null
+      this.lastGlobeUploadAt = performance.now()
 
       try {
-        const tiles = await renderMapTiles(items, index)
-        await this.uploadMapTilesSequential(tiles, forceAllTiles)
-        this.lastMapKey = mapKey
+        const tiles = await renderMapTiles(this.mapItems, this.mapIndex, rotY)
+        await this.uploadMapTilesSequential(tiles, false)
       } catch (err) {
-        console.warn('[hud] map render failed:', err)
+        console.warn('[hud] globe frame failed:', err)
       }
     }
   }
@@ -341,14 +498,13 @@ export class GlassesHud {
   }
 
   private async upgradePopContainer(snapshot: MonitorSnapshot): Promise<void> {
-    const popText = formatPopOverlay(snapshot)
-    const contentOffset = snapshot.overlay === 'detail' ? snapshot.detailScrollOffset : 0
+    const popText = formatDetailOverlay(snapshot)
 
     const ok = await this.bridge.textContainerUpgrade(
       new TextContainerUpgrade({
         containerID: INFO_CONTAINER_ID,
         containerName: 'info-feed',
-        contentOffset,
+        contentOffset: snapshot.detailScrollOffset,
         contentLength: popText.length,
         content: popText,
       }),
@@ -357,16 +513,23 @@ export class GlassesHud {
   }
 
   private async renderPanel(snapshot: MonitorSnapshot): Promise<void> {
-    const overlayOpen = snapshot.overlay !== 'none'
+    const mode = snapshot.overlay
+    const feedKey =
+      mode === 'module'
+        ? `${snapshot.module}|${this.mapItems.map(item => item.id).join(',')}`
+        : ''
 
-    if (overlayOpen !== this.overlayLayoutOpen) {
-      await this.rebuildForOverlay(overlayOpen)
+    const modeChanged = mode !== this.overlayMode
+    const feedChanged = mode === 'module' && feedKey !== this.lastFeedKey
+
+    if (modeChanged || feedChanged) {
+      await this.rebuildForOverlayMode(mode, this.mapItems)
+      if (mode === 'module') this.lastFeedKey = feedKey
     }
 
-    if (!overlayOpen) return
+    if (mode !== 'detail') return
 
     const panelKey = [
-      snapshot.overlay,
       snapshot.module,
       snapshot.index,
       snapshot.detailScrollOffset,
@@ -378,30 +541,113 @@ export class GlassesHud {
     await this.upgradePopContainer(snapshot)
   }
 
+  /** Module feed: track native list selection (row 0 = Back). */
+  private handleModuleFeedScroll(
+    event: EvenHubEvent,
+    listEvent: List_ItemEvent | undefined,
+    hold: GlassesHoldGesture,
+  ): boolean {
+    if (!this.scrollHandlers.isModuleFeed()) return false
+
+    const items = this.scrollHandlers.getFeedItems()
+    const rowCount = moduleFeedItemNames(items).length
+    const prevIndex = this.nativeFeedIndex
+    const scrollType = resolveScrollType(event)
+    const listType = listEvent ? normalizeEventType(listEvent.eventType) : undefined
+    const type = listType ?? scrollType
+
+    let nextIndex = listEvent ? resolveFeedIndex(listEvent, items) : undefined
+    if (
+      nextIndex === undefined &&
+      (type === OsEventTypeList.SCROLL_TOP_EVENT ||
+        type === OsEventTypeList.SCROLL_BOTTOM_EVENT)
+    ) {
+      nextIndex = inferFeedListIndex(prevIndex, type, rowCount)
+    }
+
+    if (
+      type === OsEventTypeList.SCROLL_TOP_EVENT ||
+      type === OsEventTypeList.SCROLL_BOTTOM_EVENT
+    ) {
+      if (nextIndex !== undefined) {
+        this.nativeFeedIndex = nextIndex
+        this.scrollHandlers.setFeedIndex(nextIndex)
+      }
+      return true
+    }
+
+    if (listEvent) {
+      if (nextIndex !== undefined) {
+        this.nativeFeedIndex = nextIndex
+        this.scrollHandlers.setFeedIndex(nextIndex)
+      }
+
+      if (isClickEvent(listType)) {
+        if (isFeedBackListEvent(listEvent)) {
+          this.nativeFeedIndex = 0
+          this.scrollHandlers.setFeedIndex(0)
+          hold.onPressEnd(() => this.scrollHandlers.glassesGoBack())
+          return true
+        }
+
+        const tapIndex = nextIndex ?? this.nativeFeedIndex
+        this.nativeFeedIndex = tapIndex
+        this.scrollHandlers.setFeedIndex(tapIndex)
+        hold.onPressEnd(() => this.scrollHandlers.glassesTapFeedRow(tapIndex))
+      }
+      return true
+    }
+
+    return false
+  }
+
   bindEvents(): () => void {
     let lastEventAt = 0
     const DEBOUNCE_MS = 250
+    const hold = new GlassesHoldGesture()
+
+    const canGoBack = (): boolean =>
+      !this.scrollHandlers.isHomeMenu()
+
+    const onHold = (): void => {
+      if (!canGoBack()) return
+      this.scrollHandlers.glassesGoBack()
+    }
+
+    const onTap = (): void => {
+      if (this.scrollHandlers.isHomeMenu()) {
+        this.scrollHandlers.openSelectedModule()
+        return
+      }
+      if (this.scrollHandlers.isModuleFeed()) {
+        this.scrollHandlers.glassesTap()
+        return
+      }
+      this.scrollHandlers.glassesTap()
+    }
 
     const handleListEvent = (event: EvenHubEvent): void => {
-      if (!this.scrollHandlers.isHomeMenu() || !event.listEvent) return
+      if (!event.listEvent) return
 
       const listEvent = event.listEvent
       const type = normalizeEventType(listEvent.eventType)
-      const index = resolveListIndex(listEvent)
 
-      if (index !== undefined) {
-        this.scrollHandlers.setPickerIndex(index)
-      }
+      if (this.scrollHandlers.isHomeMenu()) {
+        const index = resolveListIndex(listEvent)
+        if (index !== undefined) {
+          this.scrollHandlers.setPickerIndex(index)
+        }
 
-      if (
-        type === OsEventTypeList.SCROLL_TOP_EVENT ||
-        type === OsEventTypeList.SCROLL_BOTTOM_EVENT
-      ) {
-        return
-      }
+        if (
+          type === OsEventTypeList.SCROLL_TOP_EVENT ||
+          type === OsEventTypeList.SCROLL_BOTTOM_EVENT
+        ) {
+          return
+        }
 
-      if (type === OsEventTypeList.CLICK_EVENT || type === undefined) {
-        this.scrollHandlers.openSelectedModule()
+        if (isClickEvent(type)) {
+          hold.onPressEnd(onTap)
+        }
       }
     }
 
@@ -413,14 +659,17 @@ export class GlassesHud {
       lastEventAt = now
 
       if (type === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+        hold.cancel()
         void this.bridge.shutDownPageContainer(1)
         return
       }
 
       if (this.scrollHandlers.isHomeMenu()) return
 
+      if (this.scrollHandlers.isModuleFeed()) return
+
       if (type === OsEventTypeList.CLICK_EVENT) {
-        this.scrollHandlers.glassesTap()
+        hold.onPressEnd(onTap)
         return
       }
 
@@ -438,12 +687,28 @@ export class GlassesHud {
         type === OsEventTypeList.SYSTEM_EXIT_EVENT ||
         type === OsEventTypeList.ABNORMAL_EXIT_EVENT
       ) {
+        hold.cancel()
         this.pageReady = false
-        this.overlayLayoutOpen = false
+        this.overlayMode = 'none'
       }
     }
 
     return this.bridge.onEvenHubEvent(event => {
+      if (isLongPressEvent(event)) {
+        hold.cancel()
+        onHold()
+        return
+      }
+
+      if (this.handleModuleFeedScroll(event, event.listEvent, hold)) {
+        return
+      }
+
+      if (isPressStart(event)) {
+        if (canGoBack()) hold.onPressStart(onHold)
+        return
+      }
+
       if (event.listEvent) {
         handleListEvent(event)
         return

@@ -1,4 +1,5 @@
-import { renderCompanionMapSvg } from './map/render-map'
+import { mountCompanionGlobe } from './map/companion-globe'
+import { subscribeGlobeRotation } from './map/globe-rotation'
 import { MODULES } from './modules/definitions'
 import type { MonitorState, MonitorSnapshot } from './monitor-state'
 
@@ -51,8 +52,9 @@ export function mountCompanionUi(state: MonitorState, root: HTMLElement): void {
           <li><strong>Item tap</strong> → detail overlay stacked above</li>
           <li><strong>Backdrop / × / Esc</strong> → close top overlay</li>
           <li><strong>Glasses scroll</strong> → move list selection (WIRE, CHAT…)</li>
-          <li><strong>Glasses tap</strong> → open module pop window · tap again for full text</li>
-          <li><strong>Scroll up</strong> at top → back to module picker</li>
+          <li><strong>Glasses tap</strong> → open module · tap item for full text · tap <strong>← BACK</strong> to return</li>
+          <li><strong>Scroll up</strong> on first item → back to home menu</li>
+          <li><strong>Hold tap ~1.5s</strong> → back (detail → module → home)</li>
         </ul>
       </section>
     </div>
@@ -87,14 +89,19 @@ export function mountCompanionUi(state: MonitorState, root: HTMLElement): void {
     modulePanel.appendChild(btn)
   }
 
+  let latestIndex = 0
+
+  mountCompanionGlobe(
+    mapHost,
+    () => state.getItems(),
+    () => latestIndex,
+    subscribeGlobeRotation,
+  )
+
   function renderModuleButtons(snapshot: MonitorSnapshot): void {
     modulePanel.querySelectorAll<HTMLButtonElement>('.module-btn').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.module === snapshot.module)
     })
-  }
-
-  function renderMap(snapshot: MonitorSnapshot): void {
-    mapHost.innerHTML = renderCompanionMapSvg(state.getItems(), snapshot.index)
   }
 
   function triggerPop(el: HTMLElement, className = 'is-popping'): void {
@@ -114,9 +121,21 @@ export function mountCompanionUi(state: MonitorState, root: HTMLElement): void {
     moduleOverlayTitle.textContent = snapshot.moduleLabel
     moduleOverlayList.innerHTML = ''
 
+    const backLi = document.createElement('li')
+    backLi.className =
+      snapshot.feedListIndex === 0 ? 'module-item module-item-back active' : 'module-item module-item-back'
+    backLi.innerHTML = `<span class="module-item-title">← Back</span>`
+    backLi.addEventListener('click', e => {
+      e.stopPropagation()
+      state.closeAllOverlays()
+    })
+    moduleOverlayList.appendChild(backLi)
+
     for (const [i, item] of state.getItems().entries()) {
+      const listIndex = i + 1
       const li = document.createElement('li')
-      li.className = i === snapshot.index ? 'module-item active' : 'module-item'
+      li.className =
+        listIndex === snapshot.feedListIndex ? 'module-item active' : 'module-item'
       li.innerHTML = `
         <span class="module-item-dot" style="background:${item.color}"></span>
         <span class="module-item-time">${item.time}${i === 0 ? ' · latest' : ''}</span>
@@ -152,9 +171,9 @@ export function mountCompanionUi(state: MonitorState, root: HTMLElement): void {
   function render(snapshot: MonitorSnapshot): void {
     const prevOverlay = lastOverlay
     lastOverlay = snapshot.overlay
+    latestIndex = snapshot.index
 
     renderModuleButtons(snapshot)
-    renderMap(snapshot)
 
     if (snapshot.overlay === 'module' || snapshot.overlay === 'detail') {
       showModuleOverlay(snapshot, prevOverlay === 'none')

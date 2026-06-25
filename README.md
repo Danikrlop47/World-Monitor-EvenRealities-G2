@@ -28,7 +28,8 @@ Open the companion UI in your browser at `http://localhost:5173`. The simulator 
 |---|---|
 | Scroll down | Next (older) event |
 | Scroll up | Previous (newer) event |
-| Tap | Open / close full article |
+| Tap | Open module / open article |
+| Hold tap (~1.5s) | Back one screen (detail → module → home) |
 | Double-click | Exit app |
 
 On the phone companion UI, tap any event in **The Wire** list to open a detail window with the full text.

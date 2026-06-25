@@ -1,38 +1,48 @@
 import { MODULES } from './definitions'
+import type { ModuleItem } from './demo-data'
 import type { MonitorSnapshot } from '../monitor-state'
 import { truncate } from '../types'
 
 /** G2 textContainerUpgrade content limit */
 const GLASSES_TEXT_MAX = 2000
 
+/** G2 list item name limit */
+const LIST_ITEM_MAX = 64
+
 /** Labels for the native G2 list menu (glasses home picker). */
 export function moduleListItemNames(): string[] {
   return MODULES.map(m => `${m.num} ${m.label}`)
 }
 
-export function formatModuleOverlay(snapshot: MonitorSnapshot): string {
-  const { item, index, total, moduleLabel } = snapshot
+export const FEED_BACK_ROW_LABEL = '← BACK'
 
-  return [
-    `[ ${moduleLabel} ]`,
-    `${index + 1}/${total}`,
-    '',
-    truncate(item.title, 54),
-    `${item.time}  ${truncate(item.location.split(',')[0], 28)}`,
-    '',
-    truncate(item.summary, 170),
-    '',
-    'Scroll = browse  ·  Tap = full text  ·  Scroll up = back',
-  ].join('\n')
+/** Back row + one row per feed item — same native list style as the home module menu. */
+export function moduleFeedItemNames(items: ModuleItem[]): string[] {
+  const rows = items.map((item, i) => {
+    const latest = i === 0 ? ' · latest' : ''
+    return truncate(`${item.time}${latest}  ${item.title}`, LIST_ITEM_MAX)
+  })
+  return [FEED_BACK_ROW_LABEL, ...rows]
+}
+
+export function isFeedBackRow(listIndex: number): boolean {
+  return listIndex === 0
+}
+
+export function isFeedBackListEvent(listEvent: { currentSelectItemName?: string }): boolean {
+  return listEvent.currentSelectItemName === FEED_BACK_ROW_LABEL
+}
+
+export function feedListIndexToItemIndex(listIndex: number): number {
+  return listIndex - 1
 }
 
 export function formatDetailOverlay(snapshot: MonitorSnapshot): string {
   const { item, moduleLabel } = snapshot
   const header = [
-    '<< TAP BACK',
+    moduleLabel,
+    `${item.time} · ${truncate(item.location, 48)}`,
     '',
-    `${moduleLabel}`,
-    truncate(item.location, 52),
     truncate(item.title, 56),
     '',
   ].join('\n')
@@ -40,12 +50,6 @@ export function formatDetailOverlay(snapshot: MonitorSnapshot): string {
   return (header + item.body).slice(0, GLASSES_TEXT_MAX)
 }
 
-export function formatPopOverlay(snapshot: MonitorSnapshot): string {
-  if (snapshot.overlay === 'module') return formatModuleOverlay(snapshot)
-  return formatDetailOverlay(snapshot)
-}
-
 export function formatGlassesPanel(snapshot: MonitorSnapshot): string {
-  if (snapshot.overlay === 'module') return formatModuleOverlay(snapshot)
   return formatDetailOverlay(snapshot)
 }

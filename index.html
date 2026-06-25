@@ -255,6 +255,8 @@
       .map-area {
         padding: 8px;
         background: #0a0a0a;
+        min-height: 0;
+        overflow: hidden;
       }
 
       .map-host {
@@ -262,14 +264,18 @@
         border-radius: 8px;
         border: 1px solid var(--border);
         overflow: hidden;
-        height: 100%;
-        min-height: 260px;
+        position: relative;
+        width: 100%;
+        aspect-ratio: 428 / 288;
+        min-height: 0;
       }
 
-      .map-host svg {
+      .map-host .globe-canvas {
+        position: absolute;
+        inset: 0;
         display: block;
         width: 100%;
-        height: auto;
+        height: 100%;
       }
 
       .hints ul {
